@@ -1,0 +1,489 @@
+---
+title: "VIBASS4 2021 - R-INLA"
+author: "Janet van Niekerk"
+date: "13/07/2021"
+output: html_document
+---
+
+```{r setup and install INLA, include=FALSE}
+# Install INLA and dependencies (from CRAN)
+#install.packages("INLA", dep = TRUE, repos = "https://inla.r-inla-download.org/R/stable")
+knitr::opts_chunk$set(echo = TRUE)
+library("INLA")
+library("spdep")
+library("rgdal")
+library("RColorBrewer")
+library("spatstat")
+library("sp")
+library("maptools")
+library("latticeExtra")
+library("gridExtra")
+library("gstat")
+library("ggplot2")
+library("MASS")
+library("JointModel")
+
+```
+
+## INLA
+
+Integrated Nested Laplace Approximations (INLA) is an approximate method to do posterior inference. It does not use sampling, but explicitly calculates the posterior distributions of the elements in the latent field and the hyperparameters.
+
+It is very very fast and accurate. and for huge samples (like climate models using global data), it is one of very few frameworks that can be used.
+
+The only assumption needed is that the statistical model is a Latent Gaussian Model (LGM).
+
+# Latent Gaussian models
+This is a fancy name for a hierarchical Bayesian model of the following form:
+\begin{eqnarray*}
+&&Y\sim  F(\mu,\pmb{\theta}_1) \text{any likelihood}\\
+&&\mu = g(\eta)\text{, with } \eta = \pmb{X\beta}^\top + \sum_{j=1}^{k}f^{j}(\pmb{u}_j|\pmb{\theta}_2)\\
+&&\{\pmb{\eta},\pmb{B}, \pmb{f}\}\sim \color{blue}{N(\pmb{0},\pmb{Q}^{-1})} \\
+&&\pmb{\theta}=\{\pmb{\theta}_1,\pmb{\theta}_2\}\sim G(...) \text{any prior for the hyperparameters}
+\end{eqnarray*}
+
+Most statistical models are actually LGM's - spatial models, temporal models, spline models, GLM, GLZ, survival models, joint models etc.
+
+# Which models are included in R-INLA?
+```{r Intro}
+names(inla.models()$likelihood)
+names(inla.models()$latent)
+names(inla.models()$link)
+names(inla.models()$prior)
+# inla.doc("rw2")
+names(inla.models()$latent)
+#What are the default priors?
+inla.set.control.fixed.default()
+```
+# Simulated introductory example
+Here we simulate data from the model
+$$Y \sim N(1 + 0.5x_1 + 0.1x_2, 0.1^2)$$
+```{r Ex0}
+
+n = 100
+x1 = rnorm(n)
+x2 = rnorm(n)
+beta0 = 1
+beta1 = 0.5
+beta2 = 0.1
+eta = beta0 + beta1*x1 + beta2*x2
+y = rnorm(n, mean = eta, sd = 0.1)
+summary(y)
+
+#visualize
+sim1_data = data.frame(x1 = x1, x2 = x2, y = y)
+ggplot(data=sim1_data, aes(y)) + 
+  geom_histogram(bins = 20, 
+                 col="black", 
+                 fill="blue", 
+                 alpha = .2) + 
+  labs(title="Histogram for y", x="y", y="Count") + 
+  xlim(c(-5, 5))
+
+#Fit the GLM
+formula_sim1 <- y ~ x1 + x2
+INLA_result1_sim1 = inla(formula_sim1, 
+                        data = sim1_data, 
+                        family = "gaussian")
+
+#Posterior inference
+summary(INLA_result1_sim1)
+
+#Fixed effects
+plot(INLA_result1_sim1$marginals.fixed$x1, type = "l",
+     xlab = expression(beta[1]),
+     ylab = "Density")
+abline(v = beta1, col = "blue", lwd = 2)
+
+plot(INLA_result1_sim1$marginals.fixed$x2, type = "l",
+     xlab = expression(beta[2]),
+     ylab = "Density")
+abline(v = beta2, col = "blue", lwd = 2)
+
+#Gaussian data noise - hyperparameter
+postmarg_sd <- inla.tmarginal(function(x) x^(-1/2), 
+              INLA_result1_sim1$marginals.hyperpar$`Precision for the Gaussian observations`)
+plot(postmarg_sd[,1], postmarg_sd[,2], type="l",
+     xlab = expression(sigma),
+     ylab = "Density")
+abline(v = 0.1, col = "blue", lwd = 2)
+```
+There are various options in INLA like control.fixed (changing the default priors), control.predictor (to compute the fitted values), control.compute (to compute model selection information), control.family (changing some of the default settings for family), verbose (=TRUE gives us a "log" of all the numerics inside) and some more.
+
+# Example 1 - GLM with random effects
+
+```{r Ex1}
+
+data_cement = cement
+summary(data_cement)
+
+plot(data_cement$y, pch = 16, ylab = "Heat evolved (cals/gm)", ylim = c(0,120))
+hist(data_cement$y) # choose Gaussian response
+
+#Fit the model
+result_cement1 = inla(formula = y ~ x1 + x2 + x3 + x4,
+                      data = data_cement,
+                      family = "gaussian",
+                      control.compute=list(config = TRUE)) # include this for post.sampling
+summary(result_cement1)
+plot(result_cement1, plot.prior = TRUE)
+```
+Now we can use various built-in functions to extract information from the INLA object.
+```{r Ex1 post}
+#Working with posteriors
+plot(result_cement1$marginals.fixed$x1[,1],
+     result_cement1$marginals.fixed$x1[,2],
+     type = "l",
+     xlab = expression(paste(beta[1])),
+     ylab = expression(paste(pi, "(", beta[1], " | ", bold(y), ")")))
+
+CI_beta1 = c(result_cement1$summary.fixed$`0.025quant`[2], 
+             result_cement1$summary.fixed$`0.975quant`[2])
+CI_beta1
+#HPD
+inla.hpdmarginal(0.95, result_cement1$marginals.fixed$x1) #marginal of beta1
+##P(beta1>0|y)
+1-inla.pmarginal(0, result_cement1$marginals.fixed$x1)
+
+##Get the marginal of some other function of beta1
+#Get the marginal posterior of exp(beta1)
+postmarg_ebeta1 <- inla.tmarginal(function(x) exp(x), result_cement1$marginals.fixed$x1)
+par(mfrow=c(1,2))
+plot(result_cement1$marginals.fixed$x1[,1], result_cement1$marginals.fixed$x1[,2], type="l")
+plot(postmarg_ebeta1[,1], postmarg_ebeta1[,2], type="l")
+##P(exp(beta1)>1|y)
+1-inla.pmarginal(1, postmarg_ebeta1)
+
+###SD
+postmarg_sd <- inla.tmarginal(function(x) x^(-1/2), 
+              result_cement1$marginals.hyperpar$`Precision for the Gaussian observations`)
+plot(postmarg_sd[,1], postmarg_sd[,2], type="l")
+plot(result_cement1$marginals.hyperpar$`Precision for the Gaussian observations`[,1],
+     result_cement1$marginals.hyperpar$`Precision for the Gaussian observations`[,2], type="l")
+
+inla.zmarginal(postmarg_sd)
+```
+We can also do inference for functional combinations of latent terms. Here we want to get the posterior of $\frac{\beta_1\beta_2}{\beta_3}$.
+```{r Ex1 function_post}
+####posterior marginal of beta1*beta2/beta3
+#posterior sample
+post_sample1 <- inla.posterior.sample(100, result_cement1, selection = list(x1 = 1, x2 = 1, x3 = 1))
+post_sample1[1]
+post_sample_func1 <- inla.posterior.sample.eval(function(...) x1*x2/x3, post_sample1) #2nd arg is the post.sample
+summary(post_sample_func1[1,])
+hist(post_sample_func1[1,])
+
+#extract certain elements from a posterior sample
+latent_post_sample1 <- t(sapply(post_sample1, function(x) x$latent))
+head(latent_post_sample1)
+hyperpar_post_sample1 <- as.matrix(sapply(post_sample1, function(x) x$hyperpar))
+rownames(hyperpar_post_sample1) <- NULL
+
+```
+# Example 2 - Temporal models
+In INLA we can fit various temporal models like AR, RW and seasonal models.
+```{r Ex2}
+data(AirPassengers)
+airp.data <- data.frame(airp = as.vector(AirPassengers),
+                        month = as.factor(rep(1:12, 12)), 
+                        year = as.factor(rep(1949:1960, each = 12)),
+                        ID = 1:length(AirPassengers))
+summary(airp.data)
+plot(airp.data$airp, type = "l")
+plot(log(airp.data$airp), type = "l", xlab = "Year", ylab = "Log of the count of passengers
+     ")
+airp.data$l_airp <- log(airp.data$airp)
+
+#1. AR1
+#inla.doc("ar1")
+
+
+#2. AR1C
+Z_ar1c <- model.matrix(~ 0 + year, data = airp.data)
+Q.beta.prior <- Diagonal(12, 0.001)
+
+
+#3. Seasonal model
+#inla.doc("seasonal")
+
+
+#4. RW1 and 2
+#inla.doc("rw")
+
+```
+
+
+# Example 3 - Discrete space spatial models / Disease mapping (Besag and BYM)
+In this example we use the North Carolina Sudden Infant Death Syndrome dataset. We want to model the risk of SIDS using a spatial component.$$Y\sim \text{Poisson}(E\exp(\eta))$$
+```{r Ex3}
+data(nc.sids)
+head(nc.sids)
+hist(nc.sids$SID74)
+summary(nc.sids)
+p_hat <- sum(nc.sids$SID74) / sum(nc.sids$BIR74)
+nc.sids$E74 <- p_hat * nc.sids$BIR74
+nc.sids$nwp_hat74 <- nc.sids$NWBIR74 / nc.sids$BIR74
+
+# result1_sids <- inla(SID74 ~ nwp_hat74, data = nc.sids, 
+#                      family = "poisson",
+#                      control.compute = list(config = TRUE),
+#                      control.predictor = list(compute = TRUE),
+#                      E = E74)
+# summary(result1_sids)
+# 
+# plot(nc.sids$SID74)
+# points(nc.sids$E74*result1_sids$summary.fitted.values[,1], col = "blue", pch = 10)
+
+
+#Add iid for counties - not a spatial model
+#inla.doc("iid")
+# result2_sids <- inla(SID74 ~ nwp_hat74 + f(CNTY.ID, model = "iid"), 
+#                      data = nc.sids, 
+#                      family = "poisson",
+#                      control.compute = list(config = TRUE),
+#                      control.predictor = list(compute = TRUE),
+#                      E = E74)
+# summary(result2_sids)
+
+#Add besag for counties - a spatial model
+#inla.doc("besag")
+#Graph
+nc.sidsOGR <- readOGR(system.file("shapes/sids.shp", package="spData")[1])
+proj4string(nc.sidsOGR) <- CRS("+proj=longlat +ellps=clrk66")
+
+boston.adj <- poly2nb(nc.sidsOGR)
+B.boston <- nb2mat(boston.adj, style = "B")
+    
+p_hat <- sum(nc.sidsOGR$SID74) / sum(nc.sidsOGR$BIR74)
+nc.sidsOGR$E74 <- p_hat * nc.sidsOGR$BIR74
+nc.sidsOGR$nwp_hat74 <- nc.sidsOGR$NWBIR74 / nc.sidsOGR$BIR74
+nc.sidsOGR$CNTY_ID2 <- 1:(length(nc.sidsOGR$CNTY_ID))
+
+# result3_sids <- inla(SID74 ~ nwp_hat74 + f(CNTY_ID2, model = "besag", graph = B.boston, scale.model = TRUE), 
+#                      data = as.data.frame(nc.sidsOGR), 
+#                      family = "poisson",
+#                      control.compute = list(config = TRUE),
+#                      control.predictor = list(compute = TRUE),
+#                      E = E74)
+# summary(result3_sids)
+
+
+#Plot the data and the prediction
+plot(nc.sidsOGR, border="grey")
+plot(boston.adj, coordinates(nc.sidsOGR), add = TRUE, col = "blue")
+# spplot(nc.sidsOGR, c("SID74"), col.regions = brewer.pal(n=9, name = "GnBu"),
+#        at = seq(0, 50, 9))
+# nc.sidsOGR$fit1 <- result3_sids$summary.fitted.values$mean*nc.sids$E74
+# spplot(nc.sidsOGR, c("SID74", "fit1"), col.regions = brewer.pal(n=9, name = "GnBu"),
+#        at = seq(0, 50, 9))
+
+##BYM model
+#inla.doc("bym")
+# result4_sids <- inla(SID74 ~ nwp_hat74 + f(CNTY_ID2, model = "bym2", graph = B.boston, scale.model = TRUE), 
+#                      data = as.data.frame(nc.sidsOGR), 
+#                      family = "poisson",
+#                      control.compute = list(config = TRUE),
+#                      control.predictor = list(compute = TRUE),
+#                      E = E74)
+# summary(result4_sids)
+
+#Plot the data
+# nc.sidsOGR$fit2 <- result4_sids$summary.fitted.values$mean*nc.sids$E74
+# spplot(nc.sidsOGR, c("SID74", "fit2"), col.regions = brewer.pal(n=9, name = "GnBu"),
+#        at = seq(0, 50, 9))
+```
+
+## Example 4 - Continuous space spatial models (SPDE models)
+Now we consider a continuous spatial field (point-level data, geostatistical data).
+```{r Ex4}
+data(meuse)
+summary(meuse)
+
+coordinates(meuse) <- ~x+y
+proj4string(meuse) <- CRS("+init=epsg:28992")
+
+data(meuse.grid)
+coordinates(meuse.grid) = ~x+y
+proj4string(meuse.grid) <- CRS("+init=epsg:28992")
+gridded(meuse.grid) = TRUE
+
+#Kriging
+# Variogram and fit variogram
+vgm <- variogram(log(zinc) ~ dist, meuse)
+fit.vgm <- fit.variogram(vgm, vgm("Sph"))
+
+krg <- krige(log(zinc) ~ dist, meuse, meuse.grid, model = fit.vgm)
+
+#Add estimates to meuse.grid
+meuse.grid$zinc.krg <- krg$var1.pred
+meuse.grid$zinc.krg.sd <- sqrt(krg$var1.var)
+#plot the kriging mean and sd
+spplot(meuse.grid, c("zinc.krg"), scales = list(draw = TRUE), col.regions = brewer.pal(n=9, name = "GnBu"),
+       main = "Kriging mean of zinc", cuts = 8)
+```
+In INLA the Matern model is implemented through the weak solution of a stochastic partial differential equation (SPDE).
+We need to construct a mesh of triangles to use the finite element method (FEM) to estimate the field. Then we construct a weights matrix with respect to the mesh (A matrix).
+```{r Ex4b}
+#SPDE
+#get the boundary to construct the mesh
+meuse.bdy <- unionSpatialPolygons(as(meuse.grid, "SpatialPolygons"), rep(1, length(meuse.grid)))
+
+#define mesh
+pts <- meuse.bdy@polygons[[1]]@Polygons[[1]]@coords
+mesh.meuse <- inla.mesh.2d(loc.domain = pts, offset = c(100,250), max.edge = c(150,500))
+
+plot(mesh.meuse, asp = 1, main="")
+lines(pts, col = "red", lwd = 4)
+
+#define the structure of the covariance of u(s)
+meuse.spde <- inla.spde2.matern(mesh = mesh.meuse, alpha = 2) 
+#projection - put the data into the mesh
+A.meuse <- inla.spde.make.A(mesh = mesh.meuse, loc = coordinates((meuse)))
+s.meuse <- inla.spde.make.index(name = "s", n.spde = meuse.spde$n.spde)
+
+#create stack - the way to give all the elements needed to INLA
+meuse.stack = inla.stack(data = list(zinc = meuse$zinc),
+                         A = list(A.meuse, 1),
+                         effects = list(c(s.meuse, list(Intercept = 1)),
+                                          list(dist = meuse$dist)),
+                        tag = "meuse.data")
+
+#fit the model
+
+
+
+#Extract results
+
+#Nominal variance
+#inla.zmarginal(meuse.spde.est$marginals.variance.nominal[[1]])
+
+#Range
+#inla.zmarginal(meuse.spde.est$marginals.range.nominal[[1]])
+
+#Plot the fitted values at the observed data - does not make much sense (getting residuals)
+#get the index
+#index.fittedval = inla.stack.index(meuse.stack, "meuse.data")$data
+#meuse.grid$sinz.spde.odata = res.m1$summary.fitted.values[index.fittedval, "mean"]
+
+#Predict everywhere in my study area - redo the inla call with a different stack and hence different A
+#already have the stack for the data
+#now we need to make a stack for the entire study area
+A.meuse.pred <- inla.spde.make.A(mesh = mesh.meuse, loc = coordinates((meuse.grid)))
+meuse.stack.pred = inla.stack(data = list(zinc = NA),
+                         A = list(A.meuse.pred, 1),
+                         effects = list(c(s.meuse, list(Intercept = 1)),
+                                        list(dist = meuse.grid$dist)),
+                         tag = "meuse.pred")
+
+#join stacks's
+meuse.joined.stack = inla.stack(meuse.stack, meuse.stack.pred)
+
+#Refit the model
+# res.m2 = inla(formula = formula.meuse, data = inla.stack.data(meuse.joined.stack, spde = meuse.spde),
+#               family = "gaussian",
+#               control.predictor = list(A = inla.stack.A(meuse.joined.stack), compute = TRUE))
+
+#Check if this changed the estimated model
+# meuse.spde.est2 = inla.spde2.result(inla = res.m2,
+#                                    name = "s",
+#                                    spde = meuse.spde,
+#                                    do.transform = TRUE)
+#Nominal variance
+# inla.zmarginal(meuse.spde.est$marginals.variance.nominal[[1]])
+# inla.zmarginal(meuse.spde.est2$marginals.variance.nominal[[1]])
+
+######Now, we can compare the predicted response with the kriging
+# index.predval = inla.stack.index(meuse.joined.stack, "meuse.pred")$data
+# meuse.grid$zinc.spde.pred.mean = res.m2$summary.fitted.values[index.predval, "mean"]
+# meuse.grid$zinc.spde.pred.sd = res.m2$summary.fitted.values[index.predval, "sd"]
+# 
+# spplot(meuse.grid, c("zinc.krg", "zinc.spde.pred.mean"), cuts = 8,
+#        col.regions = brewer.pal(n=9, name = "GnBu"),
+#        main = "Predicted mean")
+# 
+# spplot(meuse.grid, c("zinc.krg.sd", "zinc.spde.pred.sd"), cuts = 8,
+#        col.regions = brewer.pal(n=9, name = "GnBu"),
+#        main = "SD of the prediction")
+
+
+```
+
+## Example 5 - Survival models
+For survival/reliability analysis we can use various response models, like Cox's proportional hazards model, Weibull etc. We can also do cure models.
+The key is to define the response as a survival object using `r inla.surv`.
+```{r Ex 5}
+data2 <- dropout
+
+
+```
+
+## Example 6 - Joint (correlated) models
+### Survival-longitudinal models
+We can do joint models in `r INLA` using a stacked idea of response and covariates.
+```{r Ex6a}
+data1 <- prostate
+data2 <- dropout
+ng<-nrow(data1)
+ns<-nrow(data2)
+data1=data1[order(data1$VisitTime),] #Just for "nice" graphs
+
+## prepare the response variable
+y.long <- c(data1$logPSA.postRT , rep(NA, ns))
+y.surv <- inla.surv(time = c(rep(NA, ng), data2$DropTime ), event = c(rep(NA, ng),data2$Status))
+Yjoint <- list(y.long, y.surv)
+N<-length(unique(data1$ID))
+
+
+linear.covariate <- data.frame(mu = as.factor(c(rep(1, ng), rep(2, ns))),
+                               b13.PSAbase = c(data1$logPSA.base, rep(0, ns)),
+                               b22.PSABase2 = c(rep(0, ng), data2$logPSA.base2 ), 
+                               b12.time = c(data1$VisitTime,rep(0,ns)),
+                               b21.time=c(rep(0,ng),data2$DropTime))
+
+
+random.covariate <- list(U11 = c(data1$ID,rep(NA, ns)),
+                         V1 = c(data1$VisitTime,rep(NA,ns)),
+                         U21 = c(data1$ID,rep(NA, ns)),
+                         U12=c(rep(NA,ng),data2$ID2),
+                         U22=c(rep(NA,ng),data2$ID2))
+
+
+#Model 1 - intslope
+# subject=c(data1$ID,data2$ID2)
+# idx=1:(ng+ns)
+# z=c(data1$VisitTime,data2$DropTime)
+# strata=c(rep(1,ng),rep(2,ns))
+# joint.data <- c(linear.covariate,random.covariate,list(subject=subject,idx=idx,z=z,strata=strata))
+# joint.data$Y <- Yjoint
+# formulaM1 = Y ~ mu+f(inla.group(V1,n=N),model="rw2",scale.model = TRUE,hyper = list(prec = list(prior="pc.prec", param=c(1, 0.01)))) + b13.PSAbase + b22.PSABase2 +
+#   f(idx, model = "intslope",args.intslope = list(subject = subject,strata = strata,covariates = z),
+#     hyper = list(gamma1 = list(fixed = TRUE),
+#                  gamma2 = list(fixed = FALSE)))
+# 
+# 
+# Jointmodelres1 = inla(formulaM1, family = c("gaussian","weibullsurv"),
+#                  data = joint.data, control.compute=list(dic=TRUE,config=TRUE))
+# 
+# summary(Jointmodelres1)
+
+#Model 2 - separate coefficients
+joint.data <- c(linear.covariate,random.covariate)
+joint.data$Y <- Yjoint
+
+formulaM2 = Y ~ mu + f(inla.group(V1,n=N),model="rw2")+ b13.PSAbase + b22.PSABase2 +
+  f(U11 , model="iid2d", n=2*(ng+ns)) +
+  f(U21, b12.time, copy="U11",fixed=TRUE)+
+  f(U12, copy="U11",fixed=FALSE)+
+  f(U22,b21.time,copy="U12",fixed=FALSE)
+
+# Jointmodelres2 = inla(formulaM2, family = c("gaussian","weibullsurv"),
+#             data = joint.data, control.compute=list(dic=TRUE))
+# 
+# summary(Jointmodelres2)
+
+#plot PSA
+# data1=data1[order(data1$VisitTime),]
+# plot(data1$VisitTime,data1$logPSA.postRT,xlab="VisitTime",ylab="log(PSA)") 
+# points(data1$VisitTime,Jointmodelres1$summary.fitted.values[1:ng,1],col='blue',pch = 20)
+# lines(Jointmodelres1$summary.random$`inla.group(V1, n = N)`[1:ng,1],Jointmodelres1$summary.random$`inla.group(V1, n = N)`[1:ng,2], col = "red", lwd = 5)
+```
