@@ -7,6 +7,7 @@ library(INLA)
 library(wesanderson)
 library(maptiles)
 
+
 # data ####
 
 dib <- read.table("dib2021kd.txt", header = TRUE, sep = "\t", dec = ".", na.strings = ".")
