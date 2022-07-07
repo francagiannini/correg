@@ -4,7 +4,7 @@ library(tmap)
 library(tmaptools)
 library(sp)
 library(INLA)
-library(wesanderson)
+#library(wesanderson)
 library(maptiles)
 
 
